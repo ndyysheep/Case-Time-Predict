@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import tensorflow as tf
@@ -5,11 +6,32 @@ from keras.layers import TimeDistributed
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import LSTM, Dense, Embedding, Input, Concatenate, Flatten, MultiHeadAttention, LayerNormalization, Add
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 import joblib
 from tensorflow.keras.layers import Dropout
+
+class PauseTrainingCallback(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        if os.path.exists('pause_training.txt'):
+            print(f"Pausing training at epoch {epoch+1}")
+            self.model.stop_training = True
+            self.model.save('paused_model.keras')
+            save_encoders()
+
+class PrintSavedValue(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        print()
+        print("最好的模型为：")
+        print(f"Epoch {epoch+1}: val_total_time_output_root_mean_squared_error = {logs['val_total_time_output_root_mean_squared_error']}")
+
+def save_encoders():
+    for key, encoder in encoders.items():
+        joblib.dump(encoder, f'MPKL/le_{key}.pkl')
+    joblib.dump(node_to_index, 'MPKL/node_to_index.pkl')
+    joblib.dump(scaler, 'MPKL/scaler.pkl')
+    joblib.dump(maxlen, 'MPKL/maxlen.pkl')
 
 # 检查是否使用GPU
 physical_devices = tf.config.list_physical_devices('GPU')
@@ -21,6 +43,17 @@ else:
 
 # 从 Excel 文件加载数据
 df = pd.read_excel('train.xlsx')
+
+# 拆分训练集和测试集
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=5140)
+train_df.to_excel('train_M.xlsx', index=False)
+test_df.to_excel('test_M.xlsx', index=False)
+
+# 分别加载训练集和测试集数据
+df = pd.read_excel('train_M.xlsx')
+test_df = pd.read_excel('test_M.xlsx')
+
+# 数据预处理
 node_sequences = df['处置部门'].str.split(';')
 event_sources = df['事件来源']
 streets = df['所属街道']
@@ -35,6 +68,7 @@ months = df['月份']
 delays = df['延期情况']
 event_levels = df['事件等级']
 processing_times = df['处置时间间隔/小时'].str.split(';').apply(lambda x: list(map(float, x)))
+total_times = df['总消耗时间/小时']
 
 # 创建节点到索引的映射
 all_nodes = sorted(set(sum(node_sequences, [])))
@@ -91,10 +125,11 @@ months_cos = months_cos[consistent_length_indices]
 delays_encoded = delays_encoded[consistent_length_indices]
 event_levels_encoded = event_levels_encoded[consistent_length_indices]
 processing_times = processing_times[consistent_length_indices]
+total_times = total_times[consistent_length_indices]
 
 # 生成训练数据
-X_nodes, X_event_sources, X_streets, X_categories, X_work_order_types, X_secondary_features, X_administrative_divisions, X_weekdays_sin, X_weekdays_cos, X_holidays, X_hours, X_months_sin, X_months_cos, X_delays, X_event_levels, y_nodes, y_processing_times = [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
-for seq, es, street, category, wo_type, sec_feat, admin_div, wd_sin, wd_cos, holiday, hour, month_sin, month_cos, delay, event_level, proc_times in zip(sequences, event_sources_encoded, streets_encoded, categories_encoded, work_order_types_encoded, secondary_features_encoded, administrative_divisions_encoded, weekdays_sin, weekdays_cos, holidays, hours, months_sin, months_cos, delays_encoded, event_levels_encoded, processing_times):
+X_nodes, X_event_sources, X_streets, X_categories, X_work_order_types, X_secondary_features, X_administrative_divisions, X_weekdays_sin, X_weekdays_cos, X_holidays, X_hours, X_months_sin, X_months_cos, X_delays, X_event_levels, y_nodes, y_processing_times, y_total_times = [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
+for seq, es, street, category, wo_type, sec_feat, admin_div, wd_sin, wd_cos, holiday, hour, month_sin, month_cos, delay, event_level, proc_times, total_time in zip(sequences, event_sources_encoded, streets_encoded, categories_encoded, work_order_types_encoded, secondary_features_encoded, administrative_divisions_encoded, weekdays_sin, weekdays_cos, holidays, hours, months_sin, months_cos, delays_encoded, event_levels_encoded, processing_times, total_times):
     for i in range(1, len(seq)):
         X_nodes.append(seq[:i])
         X_event_sources.append(es)
@@ -113,6 +148,7 @@ for seq, es, street, category, wo_type, sec_feat, admin_div, wd_sin, wd_cos, hol
         X_event_levels.append(event_level)
         y_nodes.append(seq[i])
         y_processing_times.append(proc_times[i])
+        y_total_times.append(total_time)
 
 # 填充序列
 maxlen = max(map(len, X_nodes))
@@ -133,23 +169,25 @@ X_delays = np.array(X_delays)
 X_event_levels = np.array(X_event_levels)
 y_nodes = np.array(y_nodes)
 y_processing_times = np.array(y_processing_times).reshape(-1, 1)
+y_total_times = np.array(y_total_times).reshape(-1, 1)
 
 # 归一化处理时间
 scaler = MinMaxScaler()
 y_processing_times = scaler.fit_transform(y_processing_times)
+y_total_times = scaler.fit_transform(y_total_times)
 
 # 将 y_nodes 进行独热编码
 y_nodes = np.eye(len(all_nodes))[y_nodes]
 
 # 拆分训练和测试数据
-X_train_nodes, X_test_nodes, X_train_es, X_test_es, X_train_streets, X_test_streets, X_train_categories, X_test_categories, X_train_wo_types, X_test_wo_types, X_train_sec_feats, X_test_sec_feats, X_train_admin_divs, X_test_admin_divs, X_train_weekdays_sin, X_test_weekdays_sin, X_train_weekdays_cos, X_test_weekdays_cos, X_train_holidays, X_test_holidays, X_train_hours, X_test_hours, X_train_months_sin, X_test_months_sin, X_train_months_cos, X_test_months_cos, X_train_delays, X_test_delays, X_train_event_levels, X_test_event_levels, y_train_nodes, y_test_nodes, y_train_times, y_test_times = train_test_split(
-    X_nodes, X_event_sources, X_streets, X_categories, X_work_order_types, X_secondary_features, X_administrative_divisions, X_weekdays_sin, X_weekdays_cos, X_holidays, X_hours, X_months_sin, X_months_cos, X_delays, X_event_levels, y_nodes, y_processing_times, test_size=0.2, random_state=5140)
+X_train_nodes, X_test_nodes, X_train_es, X_test_es, X_train_streets, X_test_streets, X_train_categories, X_test_categories, X_train_wo_types, X_test_wo_types, X_train_sec_feats, X_test_sec_feats, X_train_admin_divs, X_test_admin_divs, X_train_weekdays_sin, X_test_weekdays_sin, X_train_weekdays_cos, X_test_weekdays_cos, X_train_holidays, X_test_holidays, X_train_hours, X_test_hours, X_train_months_sin, X_test_months_sin, X_train_months_cos, X_test_months_cos, X_train_delays, X_test_delays, X_train_event_levels, X_test_event_levels, y_train_nodes, y_test_nodes, y_train_proc_times, y_test_proc_times, y_train_total_times, y_test_total_times = train_test_split(
+    X_nodes, X_event_sources, X_streets, X_categories, X_work_order_types, X_secondary_features, X_administrative_divisions, X_weekdays_sin, X_weekdays_cos, X_holidays, X_hours, X_months_sin, X_months_cos, X_delays, X_event_levels, y_nodes, y_processing_times, y_total_times, test_size=0.2, random_state=5140)
 
 # 定义模型参数
 embedding_dim = 64
 hidden_units = 128
-learning_rate = 0.001  # 设置学习率
-dropout_rate = 0.2  # 设置Dropout率
+learning_rate = 0.001
+dropout_rate = 0.2
 
 # 构建混合模型
 with tf.device('/GPU:0'):
@@ -212,6 +250,7 @@ with tf.device('/GPU:0'):
     # 多任务输出层
     node_output = Dense(num_classes, activation='softmax', name='node_output')(lstm_out)
     time_output = Dense(1, activation='linear', name='time_output')(lstm_out)
+    total_time_output = Dense(1, activation='linear', name='total_time_output')(lstm_out)
 
     model = Model(inputs=[
         node_input,
@@ -229,52 +268,47 @@ with tf.device('/GPU:0'):
         month_cos_input,
         delay_input,
         event_level_input
-    ], outputs=[node_output, time_output])
+    ], outputs=[node_output, time_output, total_time_output])
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 
     model.compile(
         loss={
             'node_output': 'categorical_crossentropy',
-            'time_output': 'mse'
+            'time_output': 'mse',
+            'total_time_output': 'mse'
         },
         loss_weights={
             'node_output': 0.5,
-            'time_output': 1.0
+            'time_output': 0.5,
+            'total_time_output': 1.0
         },
         optimizer=optimizer,
         metrics={
             'node_output': 'accuracy',
-            'time_output': 'mse'
+            'time_output': 'mse',
+            'total_time_output': tf.keras.metrics.RootMeanSquaredError(name='root_mean_squared_error')
         }
     )
 
-    # 定义 ModelCheckpoint 回调函数
-    checkpoint = ModelCheckpoint('best_model.keras', monitor='val_time_output_loss', save_best_only=True, mode='min')
+    # 定义 ModelCheckpoint 和 EarlyStopping 回调函数
+    checkpoint = ModelCheckpoint('best_model.keras', monitor='val_total_time_output_root_mean_squared_error', save_best_only=True, mode='min')
+    early_stopping = EarlyStopping(monitor='val_total_time_output_root_mean_squared_error', patience=10, restore_best_weights=True)
 
     # 训练模型
     history = model.fit(
         [X_train_nodes, X_train_es, X_train_streets, X_train_categories, X_train_wo_types, X_train_sec_feats,
          X_train_admin_divs, X_train_weekdays_sin, X_train_weekdays_cos, X_train_holidays, X_train_hours,
          X_train_months_sin, X_train_months_cos, X_train_delays, X_train_event_levels],
-        {'node_output': y_train_nodes, 'time_output': y_train_times},
-        epochs=100,
+        {'node_output': y_train_nodes, 'time_output': y_train_proc_times, 'total_time_output': y_train_total_times},
+        epochs=300,
         batch_size=32,
         validation_data=([X_test_nodes, X_test_es, X_test_streets, X_test_categories, X_test_wo_types, X_test_sec_feats,
                           X_test_admin_divs, X_test_weekdays_sin, X_test_weekdays_cos, X_test_holidays, X_test_hours,
                           X_test_months_sin, X_test_months_cos, X_test_delays, X_test_event_levels],
-                         {'node_output': y_test_nodes, 'time_output': y_test_times}),
-        callbacks=[checkpoint]
+                         {'node_output': y_test_nodes, 'time_output': y_test_proc_times, 'total_time_output': y_test_total_times}),
+        callbacks=[checkpoint, early_stopping, PrintSavedValue(), PauseTrainingCallback()]
     )
 
 # 保存模型和编码器
-joblib.dump(encoders['event_source'], 'MPKL/le_event_source.pkl')
-joblib.dump(encoders['street'], 'MPKL/le_street.pkl')
-joblib.dump(encoders['category'], 'MPKL/le_category.pkl')
-joblib.dump(encoders['work_order_type'], 'MPKL/le_work_order_type.pkl')
-joblib.dump(encoders['secondary_feature'], 'MPKL/le_secondary_feature.pkl')
-joblib.dump(encoders['administrative_division'], 'MPKL/le_administrative_division.pkl')
-joblib.dump(encoders['delay'], 'MPKL/le_delay.pkl')
-joblib.dump(encoders['event_level'], 'MPKL/le_event_level.pkl')
-joblib.dump(node_to_index, 'MPKL/node_to_index.pkl')
-joblib.dump(scaler, 'MPKL/scaler.pkl')
+save_encoders()
